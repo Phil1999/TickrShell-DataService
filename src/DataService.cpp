@@ -10,10 +10,11 @@ namespace StockTracker {
         : subscriber(zmq::socket_type::sub)
         , publisher(zmq::socket_type::pub)
         , db_service("stocktracker.db")
+        , currency_service()
     {
         // Set up ZeroMQ sockets
-        subscriber.connect("tcp://localhost:5556");  // Listen for commands from CLI
-        publisher.bind("tcp://*:5555");             // Publish updates to CLI
+        subscriber.connect("tcp://localhost:5557");  // Listen for commands from CLI
+        publisher.bind("tcp://*:5556");             // Publish updates to CLI
 
         // Subscribe to all command messages
         subscriber.setSubscribe("");
@@ -53,6 +54,21 @@ namespace StockTracker {
                 sendSubscriptionsList();
                 break;
 
+            case MessageType::SetCurrency:
+                spdlog::info("Handling currency change request to: {}", msg.currency);
+                if (CurrencyService::isValidCurrencyCode(msg.currency)) {
+                    current_currency = msg.currency;
+                    // Resend all current prices in new currency
+                    for (const auto& symbol : subscribed_stocks) {
+                        queryStock(symbol);
+                    }
+                    spdlog::info("Currency updated to {}", current_currency);
+                }
+                else {
+                    publisher.send(Message::makeError("Invalid currency code: " + msg.currency));
+                }
+                break;
+
             default:
                 spdlog::warn("Received unexpected message type");
                 break;
@@ -77,8 +93,26 @@ namespace StockTracker {
                 // Send a confirmation message to the CLI
                 publisher.send(Message::makeSubscribe(symbol));
 
-                // Send an immediate stock update upon subscribing
+                // Send an immediate stock update using the current currency setting
                 auto quote = mock_data.generateQuote(symbol);
+                quote.currency = "USD";  // Set base currency
+
+                // Convert if not USD
+                if (current_currency != "USD") {
+                    try {
+                        // Get exchange rate
+                        double exchange_rate = currency_service.convertCurrency(1.0, current_currency);
+                        // Apply exchange rate to the price
+                        double converted_price = quote.price * exchange_rate;
+
+                        quote.price = converted_price;
+                        quote.currency = current_currency;
+                    }
+                    catch (const std::exception& e) {
+                        spdlog::error("Currency conversion failed on subscribe: {}", e.what());
+                    }
+                }
+
                 publisher.send(Message::makeQuoteUpdate(quote));
                 storeStockPrice(symbol, quote.price, quote.timestamp);
             }
@@ -113,14 +147,38 @@ namespace StockTracker {
     }
 
     void DataService::queryStock(const std::string& symbol) {
-        if (mock_data.isValidSymbol(symbol)) {
+        if (!mock_data.isValidSymbol(symbol)) {
+            publisher.send(Message::makeError("Invalid symbol: " + symbol));
+            return;
+        }
+
+        try {
+            // Get base quote in USD
             auto quote = mock_data.generateQuote(symbol);
+            quote.currency = "USD";
+
+            // Convert if not USD
+            if (current_currency != "USD") {
+                try {
+                    double converted_price = currency_service.convertCurrency(quote.price, current_currency);
+                    quote.price = converted_price;
+                    quote.currency = current_currency;
+                    spdlog::info("Converted price from USD ${:.2f} to {} {:.2f}",
+                        quote.price / converted_price, current_currency, converted_price);
+                }
+                catch (const std::exception& e) {
+                    spdlog::error("Currency conversion failed: {}", e.what());
+                    // Continue with USD price if conversion fails
+                }
+            }
+
             publisher.send(Message::makeQuoteUpdate(quote));
             storeStockPrice(symbol, quote.price, quote.timestamp);
-            spdlog::info("Sent one-time quote for {}: ${:.2f}", symbol, quote.price);
+            spdlog::info("Sent quote for {} in {}: {}", symbol, quote.currency, quote.price);
         }
-        else {
-            publisher.send(Message::makeError("Invalid symbol: " + symbol));
+        catch (const std::exception& e) {
+            spdlog::error("Error querying stock {}: {}", symbol, e.what());
+            publisher.send(Message::makeError(e.what()));
         }
     }
 
@@ -152,13 +210,46 @@ namespace StockTracker {
         db_service.savePrice(quote);
     }
 
+    StockQuote DataService::convertQuoteCurrency(const StockQuote& quote) {
+        if (current_currency == "USD" || current_currency == quote.currency) {
+            return quote; // No conversion needed
+        }
+
+        try {
+            StockQuote converted = quote;
+            converted.price = currency_service.convertCurrency(quote.price, current_currency);
+            converted.currency = current_currency;
+            return converted;
+        }
+        catch (const std::exception& e) {
+            spdlog::warn("Currency conversion failed: {}. Using original USD price.", e.what());
+            return quote; // Return original quote on error
+        }
+    }
+
     void DataService::run() {
         // Start update thread for subscribed stocks
         std::thread update_thread([this]() {
             while (running) {
                 for (const auto& symbol : subscribed_stocks) {
                     try {
+                        // Get base quote in USD
                         auto quote = mock_data.generateQuote(symbol);
+                        quote.currency = "USD";
+
+                        // Convert if not USD
+                        if (current_currency != "USD") {
+                            try {
+                                double converted_price = currency_service.convertCurrency(quote.price, current_currency);
+                                quote.price = converted_price;
+                                quote.currency = current_currency;
+                            }
+                            catch (const std::exception& e) {
+                                spdlog::error("Currency conversion failed for {}: {}", symbol, e.what());
+                                // Continue with USD price if conversion fails
+                            }
+                        }
+
                         publisher.send(Message::makeQuoteUpdate(quote));
                         storeStockPrice(symbol, quote.price, quote.timestamp);
                     }
@@ -166,15 +257,14 @@ namespace StockTracker {
                         spdlog::error("Error generating quote for {}: {}", symbol, e.what());
                     }
                 }
-                std::this_thread::sleep_for(std::chrono::seconds(10));
+                std::this_thread::sleep_for(std::chrono::seconds(8));
             }
             });
 
         // Handle incoming messages in main thread
         while (running) {
             try {
-                // Use blocking receive (no "true" flag), so it waits until a message is received
-                if (auto msg = subscriber.receive(false)) {  // Now it's a blocking receive
+                if (auto msg = subscriber.receive(false)) {  // Blocking receive
                     spdlog::info("Received message of type: {}", static_cast<int>(msg->type));
                     handleMessage(*msg);
                 }

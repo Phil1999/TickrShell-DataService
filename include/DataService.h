@@ -1,6 +1,7 @@
 #pragma once
 #include "StockTracker/Messages.h"
 #include "StockTracker/DatabaseService.h"
+#include "StockTracker/CurrencyService.h"
 #include "MockData.h"
 #include <sqlite3.h>
 #include <unordered_set>
@@ -13,6 +14,8 @@ namespace StockTracker {
         MessageSocket publisher;    // Sends updates to CLI
         MockDataProvider mock_data; // mock stock data
         DatabaseService db_service; // Manages SQLite interactions
+        CurrencyService currency_service;
+        std::string current_currency{ "USD" };
         std::unordered_set<std::string> subscribed_stocks;
         std::atomic<bool> running{ true };
 
@@ -23,6 +26,8 @@ namespace StockTracker {
         void queryStock(const std::string& symbol);
         void sendPriceHistory(const std::string& symbol);
         void sendSubscriptionsList();
+
+        StockQuote convertQuoteCurrency(const StockQuote& quote);
 
         // Data storage (for SQLite)
         void storeStockPrice(const std::string& symbol, double price,
